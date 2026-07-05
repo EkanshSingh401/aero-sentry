@@ -20,5 +20,3 @@ wandb/
 
 # OS
 .DS_Store
-model/*.pt
-model/*.pth
