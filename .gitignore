@@ -20,3 +20,4 @@ wandb/
 
 # OS
 .DS_Store
+pipeline/cpp_signal/signal_filter

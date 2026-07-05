@@ -1,10 +1,39 @@
 """
-Consumes live sensor telemetry, maintains a rolling 30-cycle window PER
-ENGINE, runs the trained LSTM baseline for RUL inference, and writes
-predictions to InfluxDB. Also runs an independent data-quality check on
-every raw message, now using empirically-measured sensor repeat rates.
+Consumes live sensor telemetry from Kafka topic "sensor-filtered" -- the
+output of the C++ signal_filter stage, which sits between the Python
+producer and this consumer. Full pipeline:
 
-Run from pipeline/kafka/ (with producer.py running in another terminal):
+    producer.py (Python, + fault injection)
+      -> Kafka "sensor-raw"
+      -> signal_filter (C++, EMA filtering per unit/sensor)
+      -> Kafka "sensor-filtered"  (raw AND filtered values, same message)
+      -> consumer.py (this file)
+
+Maintains a rolling 30-cycle window PER ENGINE using FILTERED values for
+inference, runs an LSTM trained DIRECTLY ON FILTERED DATA (lstm_filtered.py)
+for RUL the moment a window fills, and writes predictions to InfluxDB.
+Data-quality checks use the RAW values from the same message -- a filter
+would smooth out exactly the anomalies those checks are trying to detect.
+
+Key design decisions:
+
+1. State is keyed by engine unit (a dict of deques), so concurrent/
+   interleaved engines are handled correctly.
+
+2. Early-life padding matches the OFFLINE evaluation convention exactly
+   (make_test_windows_last_only() pads short trajectories by repeating
+   the first row).
+
+3. FIXED train/serve distribution mismatch, not just disclosed: the model
+   loaded here (lstm_filtered.pt) was trained directly on EMA-filtered
+   data with matching normalization stats (norm_stats_filtered.json),
+   not on raw data with raw-data stats. Filtering and normalization are
+   both linear and provably commute, so there was never an "order of
+   operations" bug to fix by rearranging code -- the only correct fix was
+   training on the actual distribution the model sees in production,
+   which is what lstm_filtered.py does.
+
+Run from pipeline/kafka/ (with producer.py AND signal_filter running):
     python consumer.py
 """
 
@@ -19,11 +48,11 @@ from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", "model"))
-from lstm_baseline import LSTMRegressor
+from lstm_baseline import LSTMRegressor  # same architecture works for the filtered-trained model too
 from data_quality import DataQualityMonitor
 
 BOOTSTRAP_SERVERS = "localhost:9092"
-TOPIC = "sensor-raw"
+TOPIC = "sensor-filtered"
 
 INFLUX_URL = "http://localhost:8086"
 INFLUX_TOKEN = "aerosentry-dev-token"
@@ -31,8 +60,8 @@ INFLUX_ORG = "aerosentry"
 INFLUX_BUCKET = "engine-health"
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "model")
-CHECKPOINT_PATH = os.path.join(MODEL_DIR, "lstm_baseline.pt")
-NORM_STATS_PATH = os.path.join(MODEL_DIR, "norm_stats.json")
+CHECKPOINT_PATH = os.path.join(MODEL_DIR, "lstm_filtered.pt")
+NORM_STATS_PATH = os.path.join(MODEL_DIR, "norm_stats_filtered.json")
 REPEAT_RATES_PATH = os.path.join(MODEL_DIR, "sensor_repeat_rates.json")
 
 
@@ -53,24 +82,32 @@ def load_model_and_stats():
         with open(REPEAT_RATES_PATH) as f:
             repeat_rates = json.load(f)
     else:
-        print(f"WARNING: {REPEAT_RATES_PATH} not found -- run "
-              f"model/compute_sensor_repeat_rates.py first.")
+        print(f"WARNING: {REPEAT_RATES_PATH} not found.")
 
     return model, feature_cols, window_size, norm_stats, repeat_rates
 
 
 def normalize_row(row: dict, feature_cols: list, norm_stats: dict) -> list:
+    """
+    Normalizes using the FILTERED sensor values (from the C++ signal_filter
+    stage) for inference, using norm_stats_filtered.json -- computed from
+    EMA-filtered training data, matching this exact transformation. This
+    is a real fix, not a disclosed workaround: an earlier version used
+    raw-data norm_stats.json here, which was a genuine train/serve
+    mismatch, since the model that consumed it had been trained on raw
+    (unfiltered) data.
+    """
     vec = []
     for col in feature_cols:
         mean, std = norm_stats[col]
-        raw = row[col]
-        vec.append((raw - mean) / std if std > 1e-8 else raw - mean)
+        filtered = row[f"{col}_filtered"]
+        vec.append((filtered - mean) / std if std > 1e-8 else filtered - mean)
     return vec
 
 
 def main():
     model, feature_cols, window_size, norm_stats, repeat_rates = load_model_and_stats()
-    print(f"Loaded model checkpoint. window_size={window_size}, "
+    print(f"Loaded FILTERED-trained model checkpoint. window_size={window_size}, "
           f"num_features={len(feature_cols)}")
 
     influx_client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
