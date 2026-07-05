@@ -121,3 +121,67 @@ end-to-end.
   check)
 - Track all future experiments in Weights & Biases for reproducible
   comparison as the model set grows
+
+## Quantile Regression (Uncertainty Bounds)
+
+A third model -- an LSTM with three parallel output heads trained on
+pinball (quantile) loss for p10/p50/p90 -- was built to provide an
+uncertainty band around the RUL estimate, rather than a bare point number.
+
+### Results
+
+| Metric                          | Value  |
+|----------------------------------|--------|
+| p50 RMSE                         | 16.34  |
+| p50 NASA score                   | 627.55 |
+| p10-p90 expected coverage        | 80.0%  |
+| p10-p90 actual coverage (val)    | 75.0%  |
+| Mean interval width (p90 - p10)  | 22.39 cycles |
+
+### Finding: the quantile model's own point estimate is worse, and that's informative
+
+The quantile model's p50 head performs substantially worse than the
+MSE-trained LSTM baseline on both RMSE and NASA score -- the NASA score
+gap (627.55 vs 283.63) is disproportionately larger than the RMSE gap,
+which is itself a signal worth explaining rather than ignoring.
+
+Root cause: pinball loss at the median (q=0.5) is mathematically equivalent
+to MAE, which optimizes toward a different central tendency than MSE
+whenever the error distribution is not symmetric (RUL values are bounded
+at 0 and capped at 125, so this asymmetry is expected). More importantly,
+**pinball loss has no awareness of the NASA scoring function's asymmetric
+late/early penalty** -- a model can be well-calibrated in the statistical
+sense (correctly capturing the 10th/90th percentiles) while performing
+poorly on the domain-specific safety metric, because nothing in its
+training objective encodes that late errors are more dangerous than early
+ones. This is a genuine, general ML engineering lesson: the training loss
+and the deployment metric are not automatically aligned, and treating them
+as interchangeable is a common, subtle mistake.
+
+The calibration result itself (75% actual vs. 80% expected coverage) is
+reasonably close given the validation set size, and the resulting 22.39
+cycle interval width is a usable, honest uncertainty band -- the model's
+statistical calibration is not the problem; using its own point estimate
+as the production prediction is.
+
+### Decision
+
+The uncertainty band (p10/p90 from this model) is retained and reported
+alongside the point estimate, but the **point estimate itself comes from
+the original MSE-trained LSTM baseline** (RMSE 12.90), not from this
+model's p50 head. This decouples "what's the best single-number
+prediction" from "how confident should we be in it" -- two related but
+distinct questions that don't have to be answered by the same training
+objective.
+
+## Updated Next Steps
+
+- Extract and visualize Transformer attention weights against known
+  degradation-sensitive sensors (sensor_2, sensor_3, sensor_4, sensor_7,
+  sensor_11, sensor_15)
+- Track all future experiments in Weights & Biases for reproducible
+  comparison as the model set grows
+- Possible future improvement: retrain quantile heads with a loss function
+  that incorporates the NASA scoring function's asymmetry directly, so the
+  calibrated bounds and the deployment-relevant point estimate are
+  optimized toward the same real-world cost structure
