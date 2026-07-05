@@ -1,21 +1,8 @@
 """
 Consumes live sensor telemetry, maintains a rolling 30-cycle window PER
-ENGINE, runs the trained LSTM baseline for RUL inference the moment a
-window fills, and writes predictions to InfluxDB.
-
-Key design decisions:
-
-1. State is keyed by engine unit (a dict of deques), so concurrent/
-   interleaved engines are handled correctly.
-
-2. Early-life padding matches the OFFLINE evaluation convention exactly:
-   make_test_windows_last_only() pads short trajectories by repeating the
-   first row. Without matching that here, a live engine's first ~29
-   cycles would produce no predictions, and its 30th-cycle prediction
-   would differ from the offline pipeline's -- a silent train/serve
-   inconsistency.
-
-3. Normalization uses the exact norm_stats.json saved during training.
+ENGINE, runs the trained LSTM baseline for RUL inference, and writes
+predictions to InfluxDB. Also runs an independent data-quality check on
+every raw message, now using empirically-measured sensor repeat rates.
 
 Run from pipeline/kafka/ (with producer.py running in another terminal):
     python consumer.py
@@ -33,6 +20,7 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", "model"))
 from lstm_baseline import LSTMRegressor
+from data_quality import DataQualityMonitor
 
 BOOTSTRAP_SERVERS = "localhost:9092"
 TOPIC = "sensor-raw"
@@ -45,6 +33,7 @@ INFLUX_BUCKET = "engine-health"
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "model")
 CHECKPOINT_PATH = os.path.join(MODEL_DIR, "lstm_baseline.pt")
 NORM_STATS_PATH = os.path.join(MODEL_DIR, "norm_stats.json")
+REPEAT_RATES_PATH = os.path.join(MODEL_DIR, "sensor_repeat_rates.json")
 
 
 def load_model_and_stats():
@@ -59,7 +48,15 @@ def load_model_and_stats():
     with open(NORM_STATS_PATH) as f:
         norm_stats = json.load(f)
 
-    return model, feature_cols, window_size, norm_stats
+    repeat_rates = {}
+    if os.path.exists(REPEAT_RATES_PATH):
+        with open(REPEAT_RATES_PATH) as f:
+            repeat_rates = json.load(f)
+    else:
+        print(f"WARNING: {REPEAT_RATES_PATH} not found -- run "
+              f"model/compute_sensor_repeat_rates.py first.")
+
+    return model, feature_cols, window_size, norm_stats, repeat_rates
 
 
 def normalize_row(row: dict, feature_cols: list, norm_stats: dict) -> list:
@@ -72,7 +69,7 @@ def normalize_row(row: dict, feature_cols: list, norm_stats: dict) -> list:
 
 
 def main():
-    model, feature_cols, window_size, norm_stats = load_model_and_stats()
+    model, feature_cols, window_size, norm_stats, repeat_rates = load_model_and_stats()
     print(f"Loaded model checkpoint. window_size={window_size}, "
           f"num_features={len(feature_cols)}")
 
@@ -88,6 +85,7 @@ def main():
 
     windows = defaultdict(lambda: deque(maxlen=window_size))
     seen_units = set()
+    quality_monitor = DataQualityMonitor(norm_stats, repeat_rates=repeat_rates)
 
     print(f"Consumer connected. Listening on topic '{TOPIC}'...\n")
 
@@ -96,12 +94,25 @@ def main():
         unit = row["unit"]
         cycle = row["cycle"]
 
+        quality_flags = quality_monitor.check(unit, cycle, row)
+        if quality_flags:
+            flags_str = "; ".join(quality_flags)
+            print(f"[unit {unit}] cycle {cycle:4d}: DATA QUALITY FLAG -- {flags_str}")
+
+            quality_point = (
+                Point("data_quality")
+                .tag("unit", str(unit))
+                .field("cycle", cycle)
+                .field("flag_count", len(quality_flags))
+                .field("flags", flags_str)
+            )
+            write_api.write(bucket=INFLUX_BUCKET, record=quality_point)
+
         normalized_vec = normalize_row(row, feature_cols, norm_stats)
 
         if unit not in seen_units:
             seen_units.add(unit)
-            print(f"[unit {unit}] New engine detected -- pre-filling window "
-                  f"(matches offline padding convention).")
+            print(f"[unit {unit}] New engine detected -- pre-filling window.")
             for _ in range(window_size - 1):
                 windows[unit].append(normalized_vec)
 
