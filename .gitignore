@@ -1,11 +1,22 @@
+# Python
 venv/
 __pycache__/
 *.pyc
-data/raw/*.txt
+.pytest_cache/
+
+# Raw data - large files, don't belong in git
+data/raw/*
+
+# Model artifacts
 *.pt
 *.pth
 *.onnx
 *.rknn
-sensor_trend_check.png
 wandb/
+*.png
+
+# Env / secrets
 .env
+
+# OS
+.DS_Store
