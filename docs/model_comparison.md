@@ -1,5 +1,27 @@
 # Model Comparison: LSTM vs. Transformer for RUL Prediction
 
+## TL;DR
+
+Four RUL models were built and compared on identical data: an LSTM
+baseline, a Transformer, a quantile-regression LSTM (uncertainty bounds),
+and an LSTM trained directly against a differentiable NASA-score loss.
+
+A single-run comparison initially suggested the LSTM beat the Transformer.
+A subsequent multi-seed robustness study (3 seeds per model) showed that
+conclusion did not hold -- their result ranges overlap substantially, so
+the apparent winner in any one run was noise, not a real architectural
+difference. This is disclosed and corrected in this document rather than
+left as the original (incorrect) claim.
+
+What did hold up under the same multi-seed test: symmetric pinball loss
+produces a measurably worse point estimate than a loss aware of the NASA
+score's asymmetric penalty structure -- a real, repeatable finding about
+loss-function design, not architecture choice.
+
+**Production model:** LSTM baseline (point estimate) + quantile model
+(p10/p90 uncertainty bounds), selected for simplicity given no
+architecture showed a statistically distinguishable advantage.
+
 ## Objective
 
 Benchmark two model architectures on identical data, under identical
