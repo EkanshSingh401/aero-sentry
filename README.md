@@ -2,6 +2,9 @@
 
 Turbofan engine health monitoring and RUL (Remaining Useful Life) prognostics platform, built on NASA's C-MAPSS dataset, with a full streaming pipeline, edge deployment on Orange Pi 5, and a physical hardware demo. Built to demonstrate operational systems engineering (defense/dual-use ML target companies), not just a notebook model.
 
+## Status
+Phase 1 complete (data + modeling, verified with multi-seed robustness testing). Starting Phase 2 (streaming pipeline).
+
 ## Setup
 1. `python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt`
 2. Download NASA C-MAPSS (search "NASA C-MAPSS Turbofan Engine Degradation" or Kaggle mirror "NASA Turbofan Jet Engine Data Set"). Place `train_FD001.txt`, `test_FD001.txt`, `RUL_FD001.txt` in `data/raw/`.
