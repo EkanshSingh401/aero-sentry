@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+data/raw/*.txt
+*.pt
+*.pth
+*.onnx
+*.rknn
+sensor_trend_check.png
+wandb/
+.env

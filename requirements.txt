@@ -1,0 +1,10 @@
+torch>=2.2.0
+numpy>=1.26.0
+pandas>=2.2.0
+scikit-learn>=1.4.0
+kafka-python>=2.0.2
+influxdb-client>=1.40.0
+onnx>=1.16.0
+onnxruntime>=1.17.0
+wandb>=0.16.0
+matplotlib>=3.8.0
