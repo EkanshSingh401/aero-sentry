@@ -1,6 +1,6 @@
 # AeroSentry
 
-Turbofan engine health monitoring and RUL (Remaining Useful Life) prognostics platform, built on NASA's C-MAPSS dataset, with a full streaming pipeline, edge deployment on Orange Pi 5, and a physical hardware demo. Built to demonstrate operational systems engineering (defense/dual-use ML target companies), not just a notebook model.
+Turbofan engine health monitoring and RUL (Remaining Useful Life) prognostics platform, built on NASA's C-MAPSS dataset, with a full streaming pipeline, edge deployment on Orange Pi 5, and a physical hardware demo.
 
 ## Status
 Phase 1 complete (data + modeling, verified with multi-seed robustness testing). Starting Phase 2 (streaming pipeline).
