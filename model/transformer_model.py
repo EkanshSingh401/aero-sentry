@@ -26,13 +26,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import wandb
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "data"))
 from loader import load_subset
 from labeling import add_piecewise_rul, add_test_rul, normalize_sensors, make_windows, make_test_windows_last_only
 
 from scoring import evaluate as nasa_evaluate
-from lstm_baseline import RULDataset, split_by_unit, WINDOW_SIZE, BATCH_SIZE, LEARNING_RATE, NUM_EPOCHS, VAL_FRACTION, SEED
+from lstm_baseline import RULDataset, split_by_unit, set_all_seeds, WINDOW_SIZE, BATCH_SIZE, LEARNING_RATE, NUM_EPOCHS, VAL_FRACTION, SEED
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -55,7 +56,7 @@ class PositionalEncoding(nn.Module):
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe.unsqueeze(0))
+        self.register_buffer("pe", pe.unsqueeze(0))  # (1, max_len, d_model)
 
     def forward(self, x):
         return x + self.pe[:, :x.size(1), :]
@@ -81,7 +82,7 @@ class TransformerEncoderLayerWithAttn(nn.Module):
         x = self.norm1(x + self.dropout(attn_out))
         ff_out = self.linear2(self.dropout(self.activation(self.linear1(x))))
         x = self.norm2(x + self.dropout(ff_out))
-        return x, attn_weights
+        return x, attn_weights  # attn_weights: (batch, seq_len, seq_len)
 
 
 class TransformerRegressor(nn.Module):
@@ -99,7 +100,7 @@ class TransformerRegressor(nn.Module):
             nn.ReLU(),
             nn.Linear(32, 1),
         )
-        self.last_attn_weights = None
+        self.last_attn_weights = None  # populated on each forward pass
 
     def forward(self, x, return_attn=False):
         x = self.input_proj(x)
@@ -110,6 +111,8 @@ class TransformerRegressor(nn.Module):
             x, attn_w = layer(x)
             attn_weights_per_layer.append(attn_w)
 
+        # Mean-pool over the time dimension (alternative to using only the
+        # last timestep -- lets every cycle in the window contribute).
         pooled = x.mean(dim=1)
         out = self.head(pooled).squeeze(-1)
 
@@ -119,6 +122,25 @@ class TransformerRegressor(nn.Module):
 
 
 def main():
+    set_all_seeds(SEED)
+    wandb.init(
+        project="aerosentry",
+        name=f"transformer_seed{SEED}",
+        config={
+            "model": "Transformer",
+            "seed": SEED,
+            "window_size": WINDOW_SIZE,
+            "batch_size": BATCH_SIZE,
+            "d_model": D_MODEL,
+            "num_heads": NUM_HEADS,
+            "num_encoder_layers": NUM_ENCODER_LAYERS,
+            "dim_feedforward": DIM_FEEDFORWARD,
+            "dropout": DROPOUT,
+            "learning_rate": LEARNING_RATE,
+            "num_epochs": NUM_EPOCHS,
+            "loss_fn": "MSE",
+        },
+    )
     print(f"Device: {DEVICE}")
 
     train_df, test_df, true_rul = load_subset("FD001")
@@ -175,6 +197,7 @@ def main():
         train_loss = float(np.mean(train_losses))
         val_loss = float(np.mean(val_losses))
         print(f"Epoch {epoch:3d}/{NUM_EPOCHS} | train_loss={train_loss:.3f} | val_loss={val_loss:.3f}")
+        wandb.log({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -204,6 +227,14 @@ def main():
     print(f"RMSE:       {metrics['rmse']:.2f}")
     print(f"NASA score: {metrics['nasa_score']:.2f}")
     print("Compare directly against the LSTM baseline: RMSE 12.90, NASA score 283.63")
+
+    wandb.log({
+        "test_rmse": metrics["rmse"],
+        "test_nasa_score": metrics["nasa_score"],
+        "test_nasa_score_avg": metrics["nasa_score"] / len(y_test),
+        "best_val_loss": best_val_loss,
+    })
+    wandb.finish()
 
 
 if __name__ == "__main__":

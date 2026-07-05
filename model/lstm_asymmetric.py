@@ -9,10 +9,17 @@ deployment.
 
 This model uses THREE heads with two different, deliberately-chosen losses:
   - p10, p90: trained on standard pinball loss. These exist purely to give
-    a statistically calibrated uncertainty interval.
+    a statistically calibrated uncertainty interval -- calibration is a
+    genuinely different objective than point-estimate accuracy, and pinball
+    loss is the right tool for it.
   - center: trained DIRECTLY on a differentiable version of the NASA scoring
     function itself (nasa_loss_torch). This head's job is the point
-    estimate, so it is optimized against the actual deployment metric.
+    estimate, so it is optimized against the actual deployment metric, not
+    a generic proxy.
+
+This means the point estimate is no longer decoupled from the uncertainty
+band by using two separate models -- one model, three heads, each trained
+against the objective that's actually appropriate for its job.
 
 Run from the model/ directory:
     python lstm_asymmetric.py
@@ -25,14 +32,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import wandb
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "data"))
 from loader import load_subset
 from labeling import add_piecewise_rul, add_test_rul, normalize_sensors, make_windows, make_test_windows_last_only
 
 from scoring import evaluate as nasa_evaluate, nasa_loss_torch
-from lstm_baseline import RULDataset, split_by_unit, WINDOW_SIZE, BATCH_SIZE, HIDDEN_SIZE, NUM_LAYERS, LEARNING_RATE, NUM_EPOCHS, VAL_FRACTION, SEED
-from lstm_quantile import pinball_loss
+from lstm_baseline import RULDataset, split_by_unit, set_all_seeds, WINDOW_SIZE, BATCH_SIZE, HIDDEN_SIZE, NUM_LAYERS, LEARNING_RATE, NUM_EPOCHS, VAL_FRACTION, SEED
+from lstm_quantile import pinball_loss, calibration_check
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -76,6 +84,24 @@ def combined_loss(p10, center, p90, target):
 
 
 def main():
+    set_all_seeds(SEED)
+    wandb.init(
+        project="aerosentry",
+        name=f"lstm_asymmetric_seed{SEED}",
+        config={
+            "model": "LSTM-Asymmetric",
+            "seed": SEED,
+            "window_size": WINDOW_SIZE,
+            "batch_size": BATCH_SIZE,
+            "hidden_size": HIDDEN_SIZE,
+            "num_layers": NUM_LAYERS,
+            "learning_rate": LEARNING_RATE,
+            "num_epochs": NUM_EPOCHS,
+            "center_loss_fn": "differentiable NASA score (clamp_d=200)",
+            "bound_loss_fn": "pinball (p10/p90)",
+            "grad_clip_max_norm": 5.0,
+        },
+    )
     print(f"Device: {DEVICE}")
 
     train_df, test_df, true_rul = load_subset("FD001")
@@ -132,6 +158,7 @@ def main():
         train_loss = float(np.mean(train_losses))
         val_loss = float(np.mean(val_losses))
         print(f"Epoch {epoch:3d}/{NUM_EPOCHS} | train_loss={train_loss:.3f} | val_loss={val_loss:.3f}")
+        wandb.log({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -174,6 +201,17 @@ def main():
     print(f"Expected coverage: 80.0%")
     print(f"Actual coverage:   {within_80*100:.1f}%")
     print(f"Mean interval width: {interval_width:.2f} cycles")
+
+    wandb.log({
+        "test_rmse": metrics["rmse"],
+        "test_nasa_score": metrics["nasa_score"],
+        "test_nasa_score_avg": metrics["nasa_score"] / len(y_test),
+        "calibration_expected_coverage": 0.80,
+        "calibration_actual_coverage": float(within_80),
+        "calibration_interval_width": interval_width,
+        "best_val_loss": best_val_loss,
+    })
+    wandb.finish()
 
 
 if __name__ == "__main__":

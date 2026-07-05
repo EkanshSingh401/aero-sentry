@@ -24,13 +24,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import wandb
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "data"))
 from loader import load_subset
 from labeling import add_piecewise_rul, add_test_rul, normalize_sensors, make_windows, make_test_windows_last_only
 
 from scoring import evaluate as nasa_evaluate
-from lstm_baseline import RULDataset, split_by_unit, WINDOW_SIZE, BATCH_SIZE, HIDDEN_SIZE, NUM_LAYERS, LEARNING_RATE, NUM_EPOCHS, VAL_FRACTION, SEED
+from lstm_baseline import RULDataset, split_by_unit, set_all_seeds, WINDOW_SIZE, BATCH_SIZE, HIDDEN_SIZE, NUM_LAYERS, LEARNING_RATE, NUM_EPOCHS, VAL_FRACTION, SEED
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -48,6 +49,9 @@ class QuantileLSTM(nn.Module):
             batch_first=True,
             dropout=0.2 if num_layers > 1 else 0.0,
         )
+        # One output head per quantile -- simplest correct way to guarantee
+        # each quantile gets its own learned mapping from the shared LSTM
+        # representation.
         self.shared = nn.Sequential(nn.Linear(hidden_size, 32), nn.ReLU())
         self.heads = nn.ModuleList([nn.Linear(32, 1) for _ in quantiles])
 
@@ -56,7 +60,7 @@ class QuantileLSTM(nn.Module):
         last_hidden = out[:, -1, :]
         shared_repr = self.shared(last_hidden)
         preds = [head(shared_repr).squeeze(-1) for head in self.heads]
-        return torch.stack(preds, dim=1)
+        return torch.stack(preds, dim=1)  # (batch, num_quantiles)
 
 
 def pinball_loss(preds: torch.Tensor, target: torch.Tensor, quantiles: list) -> torch.Tensor:
@@ -67,9 +71,12 @@ def pinball_loss(preds: torch.Tensor, target: torch.Tensor, quantiles: list) -> 
     This is what forces the p10 head to actually learn a LOW estimate (only
     10% of true values should fall below it) and the p90 head to learn a
     HIGH estimate (90% of true values should fall below it).
+
+    preds: (batch, num_quantiles)
+    target: (batch,)
     """
-    target = target.unsqueeze(1)
-    errors = target - preds
+    target = target.unsqueeze(1)  # (batch, 1) to broadcast against preds
+    errors = target - preds  # (batch, num_quantiles)
     losses = []
     for i, q in enumerate(quantiles):
         e = errors[:, i]
@@ -89,7 +96,7 @@ def calibration_check(y_true: np.ndarray, preds: np.ndarray, quantiles: list) ->
     p10, p50, p90 = preds[:, p10_idx], preds[:, p50_idx], preds[:, p90_idx]
 
     within_80 = np.mean((y_true >= p10) & (y_true <= p90))
-    expected = quantiles[2] - quantiles[0]
+    expected = quantiles[2] - quantiles[0]  # 0.9 - 0.1 = 0.8
 
     return {
         "expected_coverage": expected,
@@ -99,6 +106,23 @@ def calibration_check(y_true: np.ndarray, preds: np.ndarray, quantiles: list) ->
 
 
 def main():
+    set_all_seeds(SEED)
+    wandb.init(
+        project="aerosentry",
+        name=f"lstm_quantile_seed{SEED}",
+        config={
+            "model": "LSTM-Quantile",
+            "seed": SEED,
+            "window_size": WINDOW_SIZE,
+            "batch_size": BATCH_SIZE,
+            "hidden_size": HIDDEN_SIZE,
+            "num_layers": NUM_LAYERS,
+            "learning_rate": LEARNING_RATE,
+            "num_epochs": NUM_EPOCHS,
+            "loss_fn": "pinball (symmetric quantile loss)",
+            "quantiles": QUANTILES,
+        },
+    )
     print(f"Device: {DEVICE}")
 
     train_df, test_df, true_rul = load_subset("FD001")
@@ -153,6 +177,7 @@ def main():
         train_loss = float(np.mean(train_losses))
         val_loss = float(np.mean(val_losses))
         print(f"Epoch {epoch:3d}/{NUM_EPOCHS} | train_pinball={train_loss:.3f} | val_pinball={val_loss:.3f}")
+        wandb.log({"epoch": epoch, "train_pinball_loss": train_loss, "val_pinball_loss": val_loss})
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -169,11 +194,12 @@ def main():
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
 
+    # ---- Evaluate p50 (median) against NASA score/RMSE, same as point models ----
     X_test, y_test, test_units = make_test_windows_last_only(test_df, feature_cols, window_size=WINDOW_SIZE)
     X_test_t = torch.from_numpy(X_test).to(DEVICE)
 
     with torch.no_grad():
-        preds_test = model(X_test_t).cpu().numpy()
+        preds_test = model(X_test_t).cpu().numpy()  # (n, 3) -> p10, p50, p90
 
     p50_preds = preds_test[:, 1]
     metrics = nasa_evaluate(y_test, p50_preds)
@@ -182,6 +208,8 @@ def main():
     print(f"NASA score: {metrics['nasa_score']:.2f}")
     print("Compare against LSTM point-estimate baseline: RMSE 12.90, NASA score 283.63")
 
+    # ---- Calibration check on VALIDATION set (test set is small, val gives
+    # a more statistically meaningful calibration estimate) ----
     X_val_t = torch.from_numpy(X_val).to(DEVICE)
     with torch.no_grad():
         preds_val = model(X_val_t).cpu().numpy()
@@ -193,6 +221,16 @@ def main():
     print(f"Mean interval width (p90 - p10):       {calib['mean_interval_width']:.2f} cycles")
     print("If actual coverage is far from 80%, the uncertainty bounds are "
           "miscalibrated -- report this honestly rather than hiding it.")
+
+    wandb.log({
+        "test_rmse_p50": metrics["rmse"],
+        "test_nasa_score_p50": metrics["nasa_score"],
+        "test_nasa_score_p50_avg": metrics["nasa_score"] / len(y_test),
+        "calibration_expected_coverage": calib["expected_coverage"],
+        "calibration_actual_coverage": calib["actual_coverage"],
+        "calibration_interval_width": calib["mean_interval_width"],
+    })
+    wandb.finish()
 
 
 if __name__ == "__main__":

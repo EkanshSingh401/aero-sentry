@@ -18,6 +18,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+import wandb
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "data"))
 from loader import load_subset
@@ -32,7 +33,7 @@ NUM_LAYERS = 2
 LEARNING_RATE = 1e-3
 NUM_EPOCHS = 40
 VAL_FRACTION = 0.2
-SEED = 42
+SEED = int(os.environ.get("AEROSENTRY_SEED", 42))
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -66,12 +67,15 @@ class LSTMRegressor(nn.Module):
         )
 
     def forward(self, x):
+        # x: (batch, window, features)
         out, (h_n, c_n) = self.lstm(x)
-        last_hidden = out[:, -1, :]
+        last_hidden = out[:, -1, :]  # (batch, hidden_size)
         return self.head(last_hidden).squeeze(-1)
 
 
 def split_by_unit(units_array, val_fraction=VAL_FRACTION, seed=SEED):
+    """Return a boolean mask selecting which rows belong to validation,
+    splitting by unique unit id so no engine appears in both train and val."""
     rng = np.random.default_rng(seed)
     unique_units = np.unique(units_array)
     rng.shuffle(unique_units)
@@ -81,7 +85,43 @@ def split_by_unit(units_array, val_fraction=VAL_FRACTION, seed=SEED):
     return mask
 
 
+def set_all_seeds(seed=SEED):
+    """
+    Seeds every source of randomness that affects training results.
+
+    Found via real variance between runs: only the train/val SPLIT was
+    seeded (via np.random.default_rng in split_by_unit), but model weight
+    initialization, dropout masks, and DataLoader shuffling all draw from
+    PyTorch's global RNG, which was never seeded. Result: identical code,
+    identical data, meaningfully different metrics every run (e.g. RMSE
+    12.90 vs 14.76 on the same LSTM baseline). Fixing this is what makes
+    reported numbers actually reproducible by someone else running this
+    code, not just reproducible by luck.
+    """
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
 def main():
+    set_all_seeds(SEED)
+    wandb.init(
+        project="aerosentry",
+        name=f"lstm_baseline_seed{SEED}",
+        config={
+            "model": "LSTM",
+            "seed": SEED,
+            "window_size": WINDOW_SIZE,
+            "batch_size": BATCH_SIZE,
+            "hidden_size": HIDDEN_SIZE,
+            "num_layers": NUM_LAYERS,
+            "learning_rate": LEARNING_RATE,
+            "num_epochs": NUM_EPOCHS,
+            "loss_fn": "MSE",
+        },
+    )
     print(f"Device: {DEVICE}")
 
     train_df, test_df, true_rul = load_subset("FD001")
@@ -89,6 +129,8 @@ def main():
     test_df = add_test_rul(test_df, true_rul)
 
     feature_cols = [c for c in train_df.columns if c.startswith("sensor_")]
+    # Drop near-constant sensors (near-zero variance in FD001 under one
+    # operating condition) -- they add noise/dimensionality with no signal.
     stds = train_df[feature_cols].std()
     keep_cols = [c for c in feature_cols if stds[c] > 1e-4]
     dropped = set(feature_cols) - set(keep_cols)
@@ -97,6 +139,8 @@ def main():
 
     train_df, test_df, norm_stats = normalize_sensors(train_df, test_df, sensor_cols=feature_cols)
 
+    # Save normalization stats -- the streaming pipeline and edge deployment
+    # MUST use these exact same stats, or predictions will be garbage.
     stats_path = os.path.join(os.path.dirname(__file__), "norm_stats.json")
     with open(stats_path, "w") as f:
         json.dump({k: list(v) for k, v in norm_stats.items()}, f, indent=2)
@@ -145,6 +189,7 @@ def main():
         train_loss = float(np.mean(train_losses))
         val_loss = float(np.mean(val_losses))
         print(f"Epoch {epoch:3d}/{NUM_EPOCHS} | train_loss={train_loss:.3f} | val_loss={val_loss:.3f}")
+        wandb.log({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -158,6 +203,8 @@ def main():
 
     print(f"\nBest val loss: {best_val_loss:.3f}. Checkpoint saved to {checkpoint_path}")
 
+    # ---- Final evaluation on the OFFICIAL test set (last window per unit,
+    # matching RUL_FD001.txt ground truth) ----
     checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
@@ -174,6 +221,14 @@ def main():
     print(f"NASA score: {metrics['nasa_score']:.2f}")
     print("Published FD001 LSTM baselines typically report RMSE ~12-15, "
           "NASA score ~200-400 -- use this as a sanity range, not a target to game.")
+
+    wandb.log({
+        "test_rmse": metrics["rmse"],
+        "test_nasa_score": metrics["nasa_score"],
+        "test_nasa_score_avg": metrics["nasa_score"] / len(y_test),
+        "best_val_loss": best_val_loss,
+    })
+    wandb.finish()
 
 
 if __name__ == "__main__":
